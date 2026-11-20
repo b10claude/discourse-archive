@@ -166,7 +166,7 @@ the only script on it is the few lines behind the light/dark toggle.
 ```sh
 % ./mirror.py --help
 usage: discourse-mirror [-h] [-u URL] [--debug] [-t TARGET_DIR] [-o OUTPUT_DIR]
-                        [-s SITE_URL]
+                        [--mathjax [SRC]] [-s SITE_URL]
 
 Render a static HTML mirror from a Discourse archive
 
@@ -179,6 +179,12 @@ options:
                         Directory of the archive to read
   -o OUTPUT_DIR, --output-dir OUTPUT_DIR
                         Directory to write the rendered site into
+  --mathjax [SRC]       Render the TeX in posts with MathJax. MathJax is
+                        copied into <output-dir>/mathjax so the mirror stays
+                        self-contained; SRC is where to get it from, either a
+                        local tex-svg.js or a URL to download it from
+                        (default: https://cdnjs.cloudflare.com/ajax/libs/mathj
+                        ax/3.2.2/es5/tex-svg.js)
   -s SITE_URL, --site-url SITE_URL
                         URL where the mirror itself will be deployed (used for
                         og:url tags). Optional.
@@ -207,6 +213,8 @@ entirely.
 The generated structure looks like:
 ```
 site
+├── mathjax
+│   └── tex-svg.js
 ├── index.html
 ├── top.html
 ├── categories.html
@@ -349,6 +357,40 @@ A referenced upload that isn't in the archive (not fetched yet, or deleted on
 the source site) is left pointing at the source site, and the mirror logs how
 many such references it saw. Run `discourse-archive --backfill-uploads` to
 fetch them.
+
+### Math
+
+Sites running Discourse's math plugin leave the TeX in posts for the browser
+to typeset: it arrives in the archive as `<span class="math">` (inline) and
+`<div class="math">` (display) around the TeX source. The mirror shows that
+source as code, which beats showing it as prose but is still not the formula.
+
+`--mathjax` typesets it:
+
+```sh
+% ./mirror.py -t ./archive -o ./site --mathjax
+```
+
+MathJax is copied into `<output-dir>/mathjax/tex-svg.js` (about 2 MB) and the
+pages link to that, so the mirror doesn't depend on a CDN. By default it is
+downloaded once, from cdnjs, and a copy already in the output directory is
+left alone; pass a path instead -- `--mathjax ./tex-svg.js` -- to use one you
+already have and keep the run offline. The `tex-svg` build is the one to
+vendor: one file, no web fonts, and its SVG output takes the page's text
+color, so formulas follow the light and dark themes on their own.
+
+Only the topics that actually contain TeX link to MathJax (108 of the 556 in
+the delvingbitcoin archive), so the rest of the mirror stays as light as it
+was.
+
+MathJax normally scans a whole page for `$$...$$` and `\(...\)`; here that
+would be wrong, since the posts are prose full of code and dollar amounts.
+Page-wide scanning is turned off, and only the elements Discourse marked as
+math are converted, in document order, so the macros a post defines with
+`\newcommand` still apply to the formulas below it.
+
+Without JavaScript, or if MathJax fails to load, every formula is left
+holding its TeX source, exactly as it renders without the flag.
 
 ### Missing posts
 

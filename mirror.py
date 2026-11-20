@@ -19,6 +19,7 @@ import os
 import json
 import html
 import shutil
+import urllib.request
 import functools
 import datetime
 import dataclasses
@@ -39,6 +40,15 @@ except ImportError:
 log = logging.getLogger('mirror')
 
 
+# Where MathJax is fetched from when `--mathjax` is given no source. The
+# `tex-svg` build is the one worth vendoring: it is a single file that needs
+# no web fonts, and its SVG output inherits the page's text color, so it
+# follows the mirror's light and dark themes for free.
+MATHJAX_VERSION = '3.2.2'
+MATHJAX_URL = ('https://cdnjs.cloudflare.com/ajax/libs/mathjax/'
+               f'{MATHJAX_VERSION}/es5/tex-svg.js')
+
+
 parser = argparse.ArgumentParser(
     'discourse-mirror',
     description='Render a static HTML mirror from a Discourse archive')
@@ -54,6 +64,12 @@ parser.add_argument(
 parser.add_argument(
     '-o', '--output-dir', help='Directory to write the rendered site into',
     default=Path(os.environ.get('OUTPUT_DIR', './site')))
+parser.add_argument(
+    '--mathjax', nargs='?', const=MATHJAX_URL, metavar='SRC',
+    help='Render the TeX in posts with MathJax. MathJax is copied into '
+    '<output-dir>/mathjax so the mirror stays self-contained; SRC is where '
+    'to get it from, either a local tex-svg.js or a URL to download it from '
+    f'(default: {MATHJAX_URL})')
 parser.add_argument(
     '-s', '--site-url', help='URL where the mirror itself will be deployed '
     '(used for og:url tags). Optional.',
@@ -984,6 +1000,15 @@ div.math {
   white-space: pre-wrap;
 }
 
+/* MathJax's SVG output. It draws with `currentColor`, so it follows the page
+ * into dark mode on its own; all it needs is somewhere to go when a display
+ * equation is wider than the column. */
+mjx-container[display="true"] {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.3rem 0;
+}
+
 .discourse-local-date {
   background: var(--primary-very-low);
   padding: 0.1em 0.3em;
@@ -1459,6 +1484,81 @@ class MirrorTopic:
         return max((self.meta.get('posts_count') or len(self.posts)) - 1, 0)
 
 
+# Where the vendored copy lives, relative to the output directory. It is also
+# what the pages link to, so they stay self-contained.
+_MATHJAX_PATH = 'mathjax/tex-svg.js'
+
+
+def provide_mathjax(output_dir: Path) -> str | None:
+    """Put MathJax in the output directory, returning the path pages link to.
+
+    `--mathjax` takes either a local `tex-svg.js` to copy or a URL to download
+    (the default). An existing copy is left alone, so only the first run after
+    the output directory is wiped needs the network. Returns None if it
+    couldn't be had, in which case the pages leave the TeX as it is.
+    """
+    source = args().mathjax
+    dest = output_dir / _MATHJAX_PATH
+    if dest.is_file():
+        log.info("using the MathJax already at %s", dest)
+        return _MATHJAX_PATH
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if '://' not in str(source):
+        local = Path(source)
+        if not local.is_file():
+            log.error("--mathjax: no such file: %s", local)
+            return None
+        log.info("copying MathJax from %s to %s", local, dest)
+        shutil.copy2(local, dest)
+        return _MATHJAX_PATH
+
+    log.info("downloading MathJax from %s", source)
+    try:
+        with urllib.request.urlopen(source, timeout=60) as response:
+            body = response.read()
+    except Exception as e:
+        log.warning("could not download MathJax from %s: %s; the TeX in posts "
+                    "will be left as it is", source, e)
+        return None
+    dest.write_bytes(body)
+    log.info("saved %d KiB of MathJax to %s", len(body) // 1024, dest)
+    return _MATHJAX_PATH
+
+
+# Discourse's math plugin wraps TeX in `<span class="math">` (inline) and
+# `<div class="math">` (display), leaving it to the client to typeset.
+_MATH_RE = re.compile(r'<(?:span|div) class="math"')
+
+
+def has_math(topic: 'MirrorTopic') -> bool:
+    return any(_MATH_RE.search(post.cooked) for post in topic.posts)
+
+
+def render_mathjax(src: str) -> list[str]:
+    """The two scripts that typeset a page's math.
+
+    MathJax normally scans a page for TeX delimiters, which would be a poor
+    fit here: the posts are prose about Bitcoin, full of code and dollar
+    amounts that are not math. Page-wide scanning is turned off and the
+    `.math` elements Discourse marked are converted on their own instead --
+    in document order, so that the macros a post defines with \\newcommand
+    still apply to the formulas below it.
+
+    Without JavaScript, or if MathJax fails to load, every element is left
+    holding its TeX source, which is what the mirror shows today.
+    """
+    config = (
+        '<script>window.MathJax={startup:{typeset:false,pageReady:function(){'
+        'return MathJax.startup.defaultPageReady().then(function(){'
+        'var m=document.querySelectorAll("span.math,div.math");'
+        'for(var i=0;i<m.length;i++){try{'
+        'm[i].replaceWith(MathJax.tex2svg(m[i].textContent,'
+        '{display:m[i].tagName==="DIV"}))}catch(e){}}'
+        'document.head.appendChild(MathJax.svgStylesheet())})}}};</script>')
+    return [config, f'<script defer src="{html.escape(src)}"></script>']
+
+
 def render_missing_posts(previous_post_number: int, next_post_number: int) -> str:
     """Warning box for post numbers missing between two consecutive posts.
 
@@ -1743,7 +1843,7 @@ def render_incomplete_topic(topic: MirrorTopic) -> str:
 
 
 def render_topic(topic: MirrorTopic, base_url: str, uploads: dict[str, str],
-                 missing_uploads: set[str]) -> str:
+                 missing_uploads: set[str], mathjax: str | None = None) -> str:
     """Render a single topic (with all its posts) to an HTML document.
 
     `uploads` maps the sha1 of each archived upload to its filename (see
@@ -1763,6 +1863,9 @@ def render_topic(topic: MirrorTopic, base_url: str, uploads: dict[str, str],
         f'<meta property="og:site_name" content="{html.escape(archive_title())}">',
         f'<meta property="og:url" content="{og_url}">',
     ]
+    # Only the topics that have TeX in them pay for the MathJax download.
+    if mathjax and has_math(topic):
+        head += render_mathjax(mathjax)
 
     badges = render_category_badge(topic.category) + render_tags(topic.tags)
     body = [
@@ -2198,10 +2301,13 @@ def main() -> None:
                     uploads_dir)
     missing_uploads: set[str] = set()
 
+    mathjax = provide_mathjax(output_dir) if args().mathjax else None
+
     for topic in topics:
         full_path = output_dir / topic.filename
         log.info("rendering topic %s (%s) to %s", topic.id, topic.slug, full_path)
-        full_path.write_text(render_topic(topic, base_url, uploads, missing_uploads))
+        full_path.write_text(
+            render_topic(topic, base_url, uploads, missing_uploads, mathjax))
 
     incomplete = [t for t in topics
                   if (t.meta.get('posts_count') or 0) > len(t.posts)]
